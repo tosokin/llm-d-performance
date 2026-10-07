@@ -1,0 +1,139 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: benchmark-scripts
+data:
+  dump_prometheus.py: |
+    # Mounted from scripts/dump_prometheus.py
+    # This placeholder is replaced by the actual script at deploy time.
+    # See: oc create configmap benchmark-scripts --from-file=scripts/ -n $NAMESPACE
+  mlflow_logger.py: |
+    # Same as above
+  run_benchmark.sh: |
+    # Same as above
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: epp-benchmark
+  labels:
+    app: epp-benchmark
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: epp-benchmark
+    spec:
+      restartPolicy: Never
+      serviceAccountName: benchmark-sa
+      containers:
+        - name: benchmark
+          image: registry.access.redhat.com/ubi9/python-311:latest
+          command: ["/bin/bash"]
+          args:
+            - -c
+            - |
+              pip install --quiet guidellm mlflow urllib3 && \
+              bash /scripts/run_benchmark.sh
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: EPP_SERVICE
+              value: "optimized-baseline-epp"
+            - name: EPP_PORT
+              value: "80"
+            - name: MODEL
+              value: "Qwen/Qwen3-32B"
+            - name: GUIDELLM_RATES
+              value: "10,20,30,40,50"
+            - name: GUIDELLM_DURATION
+              value: "120"
+            - name: GUIDELLM_MAX_TOKENS
+              value: "128"
+            - name: RESULTS_DIR
+              value: "/workspace/results"
+            - name: MLFLOW_EXPERIMENT
+              value: "epp-performance"
+            - name: MLFLOW_RUN_PREFIX
+              value: "epp-perf"
+            - name: MLFLOW_TRACKING_URI
+              valueFrom:
+                secretKeyRef:
+                  name: mlflow-credentials
+                  key: MLFLOW_TRACKING_URI
+            - name: MLFLOW_TRACKING_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: mlflow-credentials
+                  key: MLFLOW_TRACKING_USERNAME
+                  optional: true
+            - name: MLFLOW_TRACKING_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mlflow-credentials
+                  key: MLFLOW_TRACKING_PASSWORD
+                  optional: true
+            - name: MLFLOW_WORKSPACE
+              valueFrom:
+                secretKeyRef:
+                  name: mlflow-credentials
+                  key: MLFLOW_WORKSPACE
+                  optional: true
+            - name: MLFLOW_TRACKING_INSECURE_TLS
+              valueFrom:
+                secretKeyRef:
+                  name: mlflow-credentials
+                  key: MLFLOW_TRACKING_INSECURE_TLS
+                  optional: true
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: results
+              mountPath: /workspace/results
+      volumes:
+        - name: scripts
+          configMap:
+            name: benchmark-scripts
+            defaultMode: 0755
+        - name: results
+          emptyDir: {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: benchmark-sa
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: benchmark-sa-monitoring
+subjects:
+  - kind: ServiceAccount
+    name: benchmark-sa
+    namespace: REPLACE_NAMESPACE
+roleRef:
+  kind: ClusterRole
+  name: cluster-monitoring-view
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: benchmark-sa-view
+subjects:
+  - kind: ServiceAccount
+    name: benchmark-sa
+roleRef:
+  kind: ClusterRole
+  name: view
+  apiGroup: rbac.authorization.k8s.io
