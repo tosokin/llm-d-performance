@@ -1,0 +1,150 @@
+# HYBRID SCALING: 4 pods × 250 workers = 1000 total workers
+# Each pod handles a different range of LoRA adapters:
+#   Pod 0: lora-adapter-0   to lora-adapter-249
+#   Pod 1: lora-adapter-250 to lora-adapter-499
+#   Pod 2: lora-adapter-500 to lora-adapter-749
+#   Pod 3: lora-adapter-750 to lora-adapter-999
+#
+# All 1000 adapters hit SIMULTANEOUSLY across 4 pods.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nyann-hybrid-config
+  namespace: nyann-bench
+data:
+  run-workers.sh: |
+    #!/bin/sh
+    set -e
+    
+    TARGET="${TARGET:-http://mock-server.nyann-bench.svc.cluster.local:8000/v1}"
+    WORKERS_PER_POD="${WORKERS_PER_POD:-250}"
+    CONCURRENCY="${CONCURRENCY:-1}"
+    DURATION="${DURATION:-60s}"
+    OUTPUT_BASE="/tmp/results"
+    
+    # Get pod index from Kubernetes Indexed Job (0, 1, 2, 3)
+    POD_INDEX="${JOB_COMPLETION_INDEX:-0}"
+    
+    # Calculate adapter range for this pod
+    START_ADAPTER=$((POD_INDEX * WORKERS_PER_POD))
+    END_ADAPTER=$((START_ADAPTER + WORKERS_PER_POD - 1))
+    
+    mkdir -p "$OUTPUT_BASE"
+    ulimit -n 65536 2>/dev/null || true
+    
+    echo "=== Pod $POD_INDEX: lora-adapter-$START_ADAPTER to lora-adapter-$END_ADAPTER ==="
+    echo "Target: $TARGET"
+    echo "Workers: $WORKERS_PER_POD, Concurrency: $CONCURRENCY, Duration: $DURATION"
+    echo ""
+    
+    # Start workers in batches
+    BATCH_SIZE=20
+    for batch_start in $(seq $START_ADAPTER $BATCH_SIZE $END_ADAPTER); do
+        batch_end=$((batch_start + BATCH_SIZE - 1))
+        if [ $batch_end -gt $END_ADAPTER ]; then
+            batch_end=$END_ADAPTER
+        fi
+        
+        echo "Starting adapters $batch_start-$batch_end..."
+        
+        for i in $(seq $batch_start $batch_end); do
+            ADAPTER="lora-adapter-${i}"
+            WORKER_NUM=$((i - START_ADAPTER))
+            mkdir -p "$OUTPUT_BASE/worker_$WORKER_NUM"
+            
+            nyann-bench generate \
+                --target "$TARGET" \
+                --model "$ADAPTER" \
+                --worker-id 0 \
+                --config "{\"load\":{\"concurrency\":$CONCURRENCY,\"duration\":\"$DURATION\"},\"workload\":{\"type\":\"faker\",\"isl\":64,\"osl\":32}}" \
+                --output-dir "$OUTPUT_BASE/worker_$WORKER_NUM" \
+                > "$OUTPUT_BASE/worker_$WORKER_NUM/output.log" 2>&1 &
+        done
+        
+        sleep 2
+    done
+    
+    echo ""
+    echo "All $WORKERS_PER_POD workers started. Waiting for completion..."
+    wait
+    
+    # Count results
+    SUCCESS=0
+    FAILED=0
+    for i in $(seq 0 $((WORKERS_PER_POD - 1))); do
+        if [ -f "$OUTPUT_BASE/worker_$i/timestamps_0.json" ]; then
+            SUCCESS=$((SUCCESS + 1))
+        else
+            FAILED=$((FAILED + 1))
+        fi
+    done
+    
+    echo ""
+    echo "=== Pod $POD_INDEX Results ==="
+    echo "Adapters: lora-adapter-$START_ADAPTER to lora-adapter-$END_ADAPTER"
+    echo "Successful: $SUCCESS, Failed: $FAILED"
+    
+    # Show errors from first 3 failed workers
+    if [ $FAILED -gt 0 ]; then
+        echo ""
+        echo "=== Error logs from failed workers ==="
+        for i in 0 1 2; do
+            if [ -f "$OUTPUT_BASE/worker_$i/output.log" ]; then
+                echo "--- Worker $i log (first 20 lines) ---"
+                head -20 "$OUTPUT_BASE/worker_$i/output.log"
+            else
+                echo "--- Worker $i: no output.log file ---"
+            fi
+        done
+    fi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nyann-hybrid-4x250
+  namespace: nyann-bench
+  labels:
+    app: nyann-hybrid-4x250
+spec:
+  backoffLimit: 0
+  completions: 4
+  parallelism: 4  # All 4 pods run simultaneously
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        app: nyann-hybrid-4x250
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: workers
+          image: quay.io/rh-ee-tosokin/nyann-bench-shell:latest
+          imagePullPolicy: Always
+          command: ["/bin/sh"]
+          args: ["/scripts/run-workers.sh"]
+          env:
+            - name: TARGET
+              value: "http://mock-server.nyann-bench.svc.cluster.local:8000/v1"
+            - name: WORKERS_PER_POD
+              value: "250"
+            - name: CONCURRENCY
+              value: "1"
+            - name: DURATION
+              value: "60s"
+          resources:
+            requests:
+              cpu: "8"
+              memory: "8Gi"
+            limits:
+              cpu: "16"
+              memory: "16Gi"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: nyann-hybrid-config
+            defaultMode: 0755

@@ -1,0 +1,133 @@
+---
+# VERTICAL SCALING: Single pod, single container, 10 workers
+# Each worker targets a DIFFERENT LoRA adapter simultaneously
+#
+# Worker 0 → lora-adapter-0
+# Worker 1 → lora-adapter-1
+# ...
+# Worker 9 → lora-adapter-9
+#
+# All 10 adapters hit SIMULTANEOUSLY from a single container.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nyann-vertical-config
+  namespace: nyann-bench
+data:
+  run-workers.sh: |
+    #!/bin/sh
+    set -e
+    
+    TARGET="${TARGET:-http://mock-server.nyann-bench.svc.cluster.local:8000/v1}"
+    NUM_WORKERS="${NUM_WORKERS:-10}"
+    CONCURRENCY="${CONCURRENCY:-1}"
+    DURATION="${DURATION:-60s}"
+    OUTPUT_BASE="/tmp/results"
+    
+    mkdir -p "$OUTPUT_BASE"
+    
+    echo "=== nyann-bench Vertical Scaling ==="
+    echo "Target: $TARGET"
+    echo "Workers: $NUM_WORKERS"
+    echo "Concurrency per worker: $CONCURRENCY"
+    echo "Duration: $DURATION"
+    echo ""
+    
+    # Verify binary works
+    echo "Verifying nyann-bench..."
+    nyann-bench --help | head -3
+    echo ""
+    
+    echo "=== Starting $NUM_WORKERS workers ==="
+    echo ""
+    
+    # Start each worker targeting a different adapter
+    PIDS=""
+    for i in $(seq 0 $((NUM_WORKERS - 1))); do
+        ADAPTER="lora-adapter-$i"
+        mkdir -p "$OUTPUT_BASE/worker_$i"
+        
+        echo "Starting worker $i → $ADAPTER"
+        
+        nyann-bench generate \
+            --target "$TARGET" \
+            --model "$ADAPTER" \
+            --config "{\"load\":{\"concurrency\":$CONCURRENCY,\"duration\":\"$DURATION\"},\"workload\":{\"type\":\"faker\",\"isl\":64,\"osl\":32}}" \
+            --output-dir "$OUTPUT_BASE/worker_$i" \
+            2>&1 | sed "s/^/[worker-$i] /" &
+        
+        PIDS="$PIDS $!"
+    done
+    
+    echo ""
+    echo "=== All $NUM_WORKERS workers started (PIDs:$PIDS) ==="
+    echo "Waiting for completion..."
+    echo ""
+    
+    # Wait for all workers to finish
+    wait
+    
+    echo ""
+    echo "=== All workers completed ==="
+    echo ""
+    
+    # Print summary from each worker
+    echo "=== Results Summary ==="
+    for i in $(seq 0 $((NUM_WORKERS - 1))); do
+        echo "--- Worker $i (lora-adapter-$i) ---"
+        if [ -f "$OUTPUT_BASE/worker_$i/timestamps_0.json" ]; then
+            cat "$OUTPUT_BASE/worker_$i/timestamps_0.json"
+        else
+            echo "No results found"
+        fi
+        echo ""
+    done
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nyann-vertical
+  namespace: nyann-bench
+  labels:
+    app: nyann-vertical
+spec:
+  backoffLimit: 0
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      labels:
+        app: nyann-vertical
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: workers
+          image: quay.io/rh-ee-tosokin/nyann-bench-shell:latest
+          imagePullPolicy: Always
+          command: ["/bin/sh"]
+          args: ["/scripts/run-workers.sh"]
+          env:
+            - name: TARGET
+              value: "http://mock-server.nyann-bench.svc.cluster.local:8000/v1"
+            - name: NUM_WORKERS
+              value: "10"
+            - name: CONCURRENCY
+              value: "1"
+            - name: DURATION
+              value: "60s"
+          resources:
+            requests:
+              cpu: "1"
+              memory: "512Mi"
+            limits:
+              cpu: "4"
+              memory: "1Gi"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: nyann-vertical-config
+            defaultMode: 0755

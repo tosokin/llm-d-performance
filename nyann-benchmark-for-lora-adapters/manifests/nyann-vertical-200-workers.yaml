@@ -1,0 +1,152 @@
+---
+# VERTICAL SCALING: Single pod, single container, 200 workers
+# Testing to find the process limit
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nyann-vertical-200-config
+  namespace: nyann-bench
+data:
+  run-workers.sh: |
+    #!/bin/sh
+    set -e
+    
+    TARGET="${TARGET:-http://mock-server.nyann-bench.svc.cluster.local:8000/v1}"
+    NUM_WORKERS="${NUM_WORKERS:-200}"
+    CONCURRENCY="${CONCURRENCY:-1}"
+    DURATION="${DURATION:-60s}"
+    OUTPUT_BASE="/tmp/results"
+    
+    mkdir -p "$OUTPUT_BASE"
+    
+    echo "=== nyann-bench Vertical Scaling ($NUM_WORKERS Workers) ==="
+    echo "Target: $TARGET"
+    echo "Workers: $NUM_WORKERS"
+    echo "Concurrency per worker: $CONCURRENCY"
+    echo "Duration: $DURATION"
+    echo ""
+    
+    # Check ulimit
+    echo "Process limits:"
+    ulimit -a 2>/dev/null || echo "ulimit not available"
+    echo ""
+    
+    # Verify binary works
+    echo "Verifying nyann-bench..."
+    nyann-bench --help | head -3
+    echo ""
+    
+    echo "=== Starting $NUM_WORKERS workers ==="
+    echo ""
+    
+    # Start workers in smaller batches
+    BATCH_SIZE=50
+    for batch_start in $(seq 0 $BATCH_SIZE $((NUM_WORKERS - 1))); do
+        batch_end=$((batch_start + BATCH_SIZE - 1))
+        if [ $batch_end -ge $NUM_WORKERS ]; then
+            batch_end=$((NUM_WORKERS - 1))
+        fi
+        
+        echo "Starting workers $batch_start to $batch_end..."
+        
+        for i in $(seq $batch_start $batch_end); do
+            ADAPTER="lora-adapter-${i}"
+            mkdir -p "$OUTPUT_BASE/worker_$i"
+            
+            nyann-bench generate \
+                --target "$TARGET" \
+                --model "$ADAPTER" \
+                --config "{\"load\":{\"concurrency\":$CONCURRENCY,\"duration\":\"$DURATION\"},\"workload\":{\"type\":\"faker\",\"isl\":64,\"osl\":32}}" \
+                --output-dir "$OUTPUT_BASE/worker_$i" \
+                > "$OUTPUT_BASE/worker_$i/output.log" 2>&1 &
+        done
+        
+        # Longer delay between batches
+        sleep 1
+    done
+    
+    echo ""
+    echo "=== All $NUM_WORKERS workers started ==="
+    echo "Waiting for completion..."
+    echo ""
+    
+    # Wait for all workers to finish
+    wait
+    
+    echo ""
+    echo "=== All workers completed ==="
+    echo ""
+    
+    # Count successful workers
+    SUCCESS=0
+    FAILED=0
+    for i in $(seq 0 $((NUM_WORKERS - 1))); do
+        if [ -f "$OUTPUT_BASE/worker_$i/timestamps_0.json" ]; then
+            SUCCESS=$((SUCCESS + 1))
+        else
+            FAILED=$((FAILED + 1))
+        fi
+    done
+    
+    echo "=== Results Summary ==="
+    echo "Successful workers: $SUCCESS"
+    echo "Failed workers: $FAILED"
+    echo ""
+    
+    # Print sample results
+    echo "=== Sample Results (first 3 workers) ==="
+    for i in 0 1 2; do
+        echo "--- Worker $i (lora-adapter-$i) ---"
+        if [ -f "$OUTPUT_BASE/worker_$i/output.log" ]; then
+            grep -E "(Requests:|Throughput:|TTFT|E2E)" "$OUTPUT_BASE/worker_$i/output.log" 2>/dev/null | head -5 || echo "No summary found"
+        fi
+    done
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nyann-vertical-200
+  namespace: nyann-bench
+  labels:
+    app: nyann-vertical-200
+spec:
+  backoffLimit: 0
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      labels:
+        app: nyann-vertical-200
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: workers
+          image: quay.io/rh-ee-tosokin/nyann-bench-shell:latest
+          imagePullPolicy: Always
+          command: ["/bin/sh"]
+          args: ["/scripts/run-workers.sh"]
+          env:
+            - name: TARGET
+              value: "http://mock-server.nyann-bench.svc.cluster.local:8000/v1"
+            - name: NUM_WORKERS
+              value: "200"
+            - name: CONCURRENCY
+              value: "1"
+            - name: DURATION
+              value: "60s"
+          resources:
+            requests:
+              cpu: "8"
+              memory: "8Gi"
+            limits:
+              cpu: "16"
+              memory: "16Gi"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: nyann-vertical-200-config
+            defaultMode: 0755
