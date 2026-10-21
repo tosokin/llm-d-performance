@@ -1,0 +1,99 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: guidellm-results-gateway
+  namespace: llm-d-perf-investigation
+  labels:
+    app.kubernetes.io/name: guidellm
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: lvms-vg1
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: guidellm-gateway-test
+  namespace: llm-d-perf-investigation
+  labels:
+    app.kubernetes.io/name: guidellm
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: guidellm
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeSelector:
+        role: loadgen
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: guidellm
+          image: ghcr.io/vllm-project/guidellm:v0.8.1
+          imagePullPolicy: Always
+          env:
+            - name: GUIDELLM__LOGGING__CONSOLE_LOG_LEVEL
+              value: INFO
+            - name: GUIDELLM__LOGGING__LOG_FILE
+              value: /results/guidellm.log
+            - name: GUIDELLM__LOGGING__LOG_FILE_LEVEL
+              value: INFO
+          args:
+            - run
+            - --disable-progress
+            - --backend
+            # Gateway endpoint. The .svc name uses the cluster DNS search path.
+            # TLS verification is disabled because the Gateway uses a
+            # cluster-generated certificate.
+            - kind=openai_http,target=https://openshift-ai-inference-data-science-gateway-class.openshift-ingress.svc:443/llm-d-perf-investigation/sim-llm,model=simulated-llama-3,request_format=/v1/completions,stream=true,verify=false,validate_backend=false,timeout=60
+            - --tokenizer
+            - kind=huggingface_auto,model=gpt2
+            - --data
+            - kind=synthetic_text,prompt_tokens=256,output_tokens=4096
+            - --profile
+            - '{"kind":"constant","rate":[1,50,100,200,300]}'
+            - --constraint
+            - kind=max_duration,seconds=120
+            - --output
+            - kind=json,path=/results/benchmarks.json
+            - --output
+            - kind=csv,path=/results/benchmarks.csv
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              memory: 8Gi
+          volumeMounts:
+            - name: results
+              mountPath: /results
+            - name: home
+              mountPath: /home/guidellm
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: results
+          persistentVolumeClaim:
+            claimName: guidellm-results-gateway
+        - name: home
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
